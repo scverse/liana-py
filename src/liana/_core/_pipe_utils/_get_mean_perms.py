@@ -44,6 +44,9 @@ An order of magnitude above the resolution of the `float32` the scores are store
 _MAX_PERM_INDEX_ELEMENTS = 1 << 24
 """Cap on how many row positions one block of permutations may hold, so that peak memory does not scale with ``n_perms``."""
 
+_MAX_PERM_STAT_ELEMENTS = 1 << 23
+"""Cap on how many interaction positions one block of permutation statistics may hold, so that peak memory does not scale with ``n_perms``."""
+
 
 def _trimean(a: CSBase, axis: int = 0) -> NDArray[np.floating]:
     """Tukey's trimean, the location estimate CellChat scores with."""
@@ -364,9 +367,50 @@ def _get_mat_idx(
     return ligand_idx, receptor_idx, source_idx, target_idx
 
 
+class PermStatsChunks:
+    """The ``(2, n_perms, n_interactions)`` permutation statistics, gathered a block of permutations at a time.
+
+    Iterating yields ``(2, n_block, n_interactions)`` blocks in permutation order, so a consumer
+    that reduces over the permutation axis never holds the whole tensor, whose size grows with
+    ``n_perms`` times the number of interactions.
+    """
+
+    def __init__(
+        self,
+        perms: NDArray[np.floating],
+        source_idx: NDArray[np.integer],
+        ligand_idx: NDArray[np.integer],
+        target_idx: NDArray[np.integer],
+        receptor_idx: NDArray[np.integer],
+    ) -> None:
+        self._perms = perms
+        self._source_idx = source_idx
+        self._ligand_idx = ligand_idx
+        self._target_idx = target_idx
+        self._receptor_idx = receptor_idx
+        self.n_perms = int(perms.shape[0])
+        self.n_interactions = int(ligand_idx.size)
+        self.shape = (2, self.n_perms, self.n_interactions)
+
+    def _block_size(self) -> int:
+        return max(1, _MAX_PERM_STAT_ELEMENTS // max(1, self.n_interactions))
+
+    def __iter__(self) -> Iterator[NDArray[np.floating]]:
+        step = self._block_size()
+        for start in range(0, self.n_perms, step):
+            stop = min(start + step, self.n_perms)
+            block = np.empty((2, stop - start, self.n_interactions), dtype=self._perms.dtype)
+            block[0] = self._perms[start:stop, self._source_idx, self._ligand_idx]
+            block[1] = self._perms[start:stop, self._target_idx, self._receptor_idx]
+            yield block
+
+    def __len__(self) -> int:
+        return -(-self.n_perms // self._block_size())
+
+
 def _calculate_pvals(
     lr_truth: NDArray[np.floating],
-    perm_stats: NDArray[np.floating] | None,
+    perm_stats: NDArray[np.floating] | PermStatsChunks | None,
     _score_fn: _AggFn,
 ) -> NDArray[np.floating] | None:
     """
@@ -378,7 +422,8 @@ def _calculate_pvals(
         Observed LR scores, shape (n_interactions,). Already proximity-weighted when the
         caller asked for spatial weighting.
     perm_stats
-        Permutation statistics, shape (2, n_perms, n_interactions)
+        Permutation statistics, shape (2, n_perms, n_interactions), or a
+        :class:`PermStatsChunks` handing them over a block at a time
     _score_fn
         Function to combine ligand and receptor statistics
 
@@ -388,6 +433,17 @@ def _calculate_pvals(
     """
     if perm_stats is None:
         return None
+
+    # The comparison against `lr_truth` and the count of exceedances are elementwise in the
+    # permutations, so a chunked tensor gives the same p-values without ever being held whole.
+    if isinstance(perm_stats, PermStatsChunks):
+        n_perms = perm_stats.n_perms
+        exceeds = np.zeros(lr_truth.shape, dtype=np.int64)
+        for block in perm_stats:
+            lr_perm_means = _score_fn(block, axis=0)
+            hit = np.greater_equal(lr_perm_means, lr_truth) | np.isclose(lr_perm_means, lr_truth, rtol=_TIE_RTOL, atol=0.0)
+            exceeds += hit.sum(axis=0)
+        return np.asarray(exceeds / n_perms)
 
     lr_perm_means = _score_fn(perm_stats, axis=0)
     n_perms = perm_stats.shape[1]
